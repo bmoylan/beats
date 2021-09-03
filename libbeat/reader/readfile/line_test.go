@@ -21,7 +21,9 @@ package readfile
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -458,4 +460,73 @@ func (r *eofWithNonZeroNumberOfBytesReader) Read(d []byte) (int, error) {
 // Verify handling of the io.Reader returning n > 0 with io.EOF.
 func TestReadWithNonZeroNumberOfBytesAndEOF(t *testing.T) {
 	testReadLines(t, [][]byte{[]byte("Hello world!\n")}, true)
+}
+
+func BenchmarkLineReader(b *testing.B) {
+	const (
+		enc          = "plain"
+		bufferSize   = 1024
+		lineMaxLimit = 1000000 // never hit by the input data
+	)
+
+	codecFactory, ok := encoding.FindEncoding(enc)
+	if !ok {
+		b.Fatalf("can not find encoding '%v'", enc)
+	}
+
+	buffer := bytes.NewBuffer(nil)
+	codec, _ := codecFactory(buffer)
+
+	runBench := func(name string, lineMaxLimit int, lines []byte) {
+		b.Run(name, func(b *testing.B) {
+			b.ReportMetric(float64(len(lines)), "input_bytes")
+			b.ReportAllocs()
+			for bN := 0; bN < b.N; bN++ {
+				// Create line reader
+				reader, err := NewLineReader(ioutil.NopCloser(bytes.NewReader(lines)), Config{codec, bufferSize, LineFeed, lineMaxLimit})
+				if err != nil {
+					b.Fatal("failed to initialize reader:", err)
+				}
+				// Read decodec lines and test
+				for i := 0; ; i++ {
+					bb, _, err := reader.Next()
+					if err != nil {
+						if err == io.EOF {
+							b.ReportMetric(float64(i), "lines")
+							break
+						} else {
+							b.Fatal("unexpected error:", err)
+						}
+					}
+					_ = bb
+				}
+			}
+
+		})
+	}
+
+	// 150540 bytes in 1000 lines
+	runBench("short lines", lineMaxLimit, createBenchmarkTestInput(1000, 9))
+	// 193526 bytes in 10 lines
+	runBench("long lines", lineMaxLimit, createBenchmarkTestInput(10, 18))
+	// 193526 bytes in 10 lines, short lineMaxLimit to exercise skipUntilNewLine
+	runBench("skip long lines", 1024, createBenchmarkTestInput(10, 18))
+}
+
+// Uses a fixed random seed to create predictable output of various line lengths.
+func createBenchmarkTestInput(numLines int, maxLenMagnitude int) []byte {
+	buf := bytes.NewBuffer(nil)
+	fixedRand := rand.New(rand.NewSource(0))
+	for i := 0; i < numLines; i++ {
+		magnitude := fixedRand.Intn(maxLenMagnitude)
+		fuzz := fixedRand.Intn(100)
+		length := (1 << magnitude) + fuzz
+		line := make([]byte, length)
+		if _, err := rand.Read(line); err != nil {
+			panic(fmt.Sprintf("failed to generate random input: %v", err))
+		}
+		buf.WriteString(base64.StdEncoding.EncodeToString(line))
+		buf.Write(lineTerminatorCharacters[LineFeed])
+	}
+	return buf.Bytes()
 }
